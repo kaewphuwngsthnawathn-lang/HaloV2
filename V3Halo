@@ -1,0 +1,941 @@
+--[[
+
+    ========================================================================
+
+    AUTO-COLLECT SYSTEM (TELEPORT + CAMERA LOCK + HOLD E)
+
+    ========================================================================
+
+    - วาป (Teleport) ไปยังตำแหน่งไอเทมโดยตรงพร้อมระบบ Anchor กันตก/กันดีด
+
+    - ล็อคมุมกล้อง (Camera Lock) หันไปที่ไอเทมเป้าหมายก่อนเริ่มกดเก็บ
+
+    - กด E ค้างไว้จนสุดหลอด (ตามค่า HoldDuration) หรือจนกว่าไอเทมจะเข้าตัว
+
+    - รองรับทั้งโฟลเดอร์ Workspace.Gameplay.Item และ Workspace.Item
+
+    ========================================================================
+
+]]--
+
+
+
+local Fluent = loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
+
+local InterfaceManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/InterfaceManager.lua"))()
+
+
+
+local httpService = game:GetService("HttpService")
+
+local Players = game:GetService("Players")
+
+local RunService = game:GetService("RunService")
+
+local VIM = game:GetService("VirtualInputManager")
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Workspace = game:GetService("Workspace")
+
+
+
+local player = Players.LocalPlayer
+
+local camera = Workspace.CurrentCamera
+
+
+
+--// SAVE MANAGER //--
+
+local SaveManager = {}
+
+do
+
+    SaveManager.Folder = "by anucha"
+
+    SaveManager.Ignore = {}
+
+    local ConfigName = player.Name
+
+
+
+    SaveManager.Parser = {
+
+        Toggle = {
+
+            Save = function(idx, object) return { type = "Toggle", idx = idx, value = object.Value } end,
+
+            Load = function(idx, data) if SaveManager.Options[idx] then SaveManager.Options[idx]:SetValue(data.value) end end,
+
+        },
+
+        Slider = {
+
+            Save = function(idx, object) return { type = "Slider", idx = idx, value = tostring(object.Value) } end,
+
+            Load = function(idx, data) if SaveManager.Options[idx] then SaveManager.Options[idx]:SetValue(data.value) end end,
+
+        },
+
+        Dropdown = {
+
+            Save = function(idx, object) return { type = "Dropdown", idx = idx, value = object.Value, mutli = object.Multi } end,
+
+            Load = function(idx, data) if SaveManager.Options[idx] then SaveManager.Options[idx]:SetValue(data.value) end end,
+
+        },
+
+        Colorpicker = {
+
+            Save = function(idx, object) return { type = "Colorpicker", idx = idx, value = object.Value:ToHex(), transparency = object.Transparency } end,
+
+            Load = function(idx, data) if SaveManager.Options[idx] then SaveManager.Options[idx]:SetValueRGB(Color3.fromHex(data.value), data.transparency) end end,
+
+        },
+
+        Keybind = {
+
+            Save = function(idx, object) return { type = "Keybind", idx = idx, mode = object.Mode, key = object.Value } end,
+
+            Load = function(idx, data) if SaveManager.Options[idx] then SaveManager.Options[idx]:SetValue(data.key, data.mode) end end,
+
+        },
+
+        Input = {
+
+            Save = function(idx, object) return { type = "Input", idx = idx, text = object.Value } end,
+
+            Load = function(idx, data) if SaveManager.Options[idx] and type(data.text) == "string" then SaveManager.Options[idx]:SetValue(data.text) end end,
+
+        },
+
+    }
+
+
+
+    function SaveManager:SetIgnoreIndexes(list)
+
+        for _, key in next, list do self.Ignore[key] = true end
+
+    end
+
+
+
+    function SaveManager:SetFolder(folder)
+
+        self.Folder = folder
+
+        self:BuildFolderTree()
+
+    end
+
+
+
+    function SaveManager:AutoSave()
+
+        return self:Save(ConfigName)
+
+    end
+
+
+
+    function SaveManager:Save(name)
+
+        if (not name) then return false, "no config file is selected" end
+
+        local fullPath = self.Folder .. "/settings/" .. name .. ".json"
+
+        local data = { objects = {} }
+
+        for idx, option in next, SaveManager.Options do
+
+            if not self.Parser[option.Type] then continue end
+
+            if self.Ignore[idx] then continue end
+
+            table.insert(data.objects, self.Parser[option.Type].Save(idx, option))
+
+        end
+
+
+
+        local success, encoded = pcall(httpService.JSONEncode, httpService, data)
+
+        if not success then return false, "failed to encode data" end
+
+        writefile(fullPath, encoded)
+
+        return true
+
+    end
+
+
+
+    function SaveManager:Load(name)
+
+        name = name or ConfigName
+
+        local file = self.Folder .. "/settings/" .. name .. ".json"
+
+        if not isfile(file) then return false, "invalid file" end
+
+        local success, decoded = pcall(httpService.JSONDecode, httpService, readfile(file))
+
+        if not success then return false, "decode error" end
+
+
+
+        for _, option in next, decoded.objects do
+
+            if self.Parser[option.type] then
+
+                task.spawn(function() self.Parser[option.type].Load(option.idx, option) end)
+
+            end
+
+        end
+
+        return true
+
+    end
+
+
+
+    function SaveManager:BuildFolderTree()
+
+        local paths = { self.Folder, self.Folder .. "/settings" }
+
+        for i = 1, #paths do
+
+            if not isfolder(paths[i]) then makefolder(paths[i]) end
+
+        end
+
+    end
+
+
+
+    function SaveManager:SetLibrary(library)
+
+        self.Library = library
+
+        self.Options = library.Options
+
+    end
+
+
+
+    function SaveManager:LoadUserConfig()
+
+        local success = self:Load(ConfigName)
+
+        if success then
+
+            self.Library:Notify({
+
+                Title = "Interface",
+
+                Content = "Auto Loader",
+
+                SubContent = "Loaded settings for " .. ConfigName,
+
+                Duration = 4
+
+            })
+
+        end
+
+    end
+
+
+
+    function SaveManager:InitializeAutoSave(interval)
+
+        task.spawn(function()
+
+            while task.wait(interval or 30) do
+
+                self:AutoSave()
+
+            end
+
+        end)
+
+    end
+
+
+
+    SaveManager:BuildFolderTree()
+
+end
+
+
+
+--// WINDOW SETUP //--
+
+local Window = Fluent:CreateWindow({
+
+    Title = "by anucha",
+
+    SubTitle = "🍋",
+
+    TabWidth = 160,
+
+    Size = UDim2.fromOffset(580, 460),
+
+    Acrylic = true,
+
+    Theme = "Dark",
+
+    MinimizeKey = Enum.KeyCode.LeftControl
+
+})
+
+
+
+-- Custom Minimize Button
+
+local function setupCustomUI(window)
+
+    local screenGui = Instance.new("ScreenGui")
+
+    screenGui.Name = "GardenHorizoneCustomUI"
+
+    screenGui.DisplayOrder = 999
+
+    
+
+    local parent = (gethui and gethui()) or game:GetService("CoreGui") or player:WaitForChild("PlayerGui")
+
+    screenGui.Parent = parent
+
+
+
+    local toggleButton = Instance.new("ImageButton")
+
+    toggleButton.Name = "MenuToggle"
+
+    toggleButton.Parent = screenGui
+
+    toggleButton.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+
+    toggleButton.BorderSizePixel = 0
+
+    toggleButton.Position = UDim2.new(0, 15, 0.2, 0)
+
+    toggleButton.Size = UDim2.new(0, 50, 0, 50)
+
+    toggleButton.Image = "rbxassetid://81617068776053"
+
+    toggleButton.ImageColor3 = Color3.fromRGB(255, 255, 255)
+
+    
+
+    local corner = Instance.new("UICorner")
+
+    corner.CornerRadius = UDim.new(0, 10)
+
+    corner.Parent = toggleButton
+
+
+
+    local stroke = Instance.new("UIStroke")
+
+    stroke.Thickness = 2
+
+    stroke.Color = Color3.fromRGB(60, 60, 60)
+
+    stroke.Parent = toggleButton
+
+
+
+    toggleButton.MouseButton1Click:Connect(function()
+
+        if window then
+
+            window:Minimize()
+
+        end
+
+    end)
+
+end
+
+setupCustomUI(Window)
+
+
+
+--// TABS //--
+
+local Tabs = {
+
+    Main = Window:AddTab({ Title = "Main", Icon = "home" }),
+
+    Farm = Window:AddTab({ Title = "Farm", Icon = "sword" }),
+
+    Settings = Window:AddTab({ Title = "Settings", Icon = "settings" })
+
+}
+
+
+
+--// REMOTES & HOOKS //--
+
+local getrab = ReplicatedStorage:FindFirstChild("ByteNetReliable")
+
+local getinvatory = ReplicatedStorage:FindFirstChild("Remotes") and ReplicatedStorage.Remotes:FindFirstChild("GetInventory")
+
+
+
+Charging = false
+
+skip = false
+
+
+
+pcall(function()
+
+    local old; old = hookmetamethod(game, '__namecall', newcclosure(function(self, ...)
+
+        local _Method = getnamecallmethod()
+
+        if _Method == "FireServer" and getrab and self == getrab then
+
+            Charging = true
+
+        end
+
+        if _Method == "InvokeServer" and getinvatory and self == getinvatory then
+
+            skip = true
+
+        end
+
+        return old(self, ...)
+
+    end))
+
+end)
+
+
+
+--// SETTINGS & STATE //--
+
+_G.AutoFarmItem = false
+
+_G.MaxWaitTime = 3.5
+
+_G.SelectedItems = {}
+
+
+
+local function GetMyRoot()
+
+    local char = player.Character
+
+    return char and char:FindFirstChild("HumanoidRootPart")
+
+end
+
+
+
+-- ระบบวาป (Teleport) แบบเสถียรตามตัวอย่างเก่า
+
+local function TeleportToTarget(cf)
+
+    local root = GetMyRoot()
+
+    if root then
+
+        root.AssemblyLinearVelocity = Vector3.zero
+
+        root.AssemblyAngularVelocity = Vector3.zero
+
+        root.Anchored = true
+
+        root.CFrame = (typeof(cf) == "Vector3" and CFrame.new(cf) or cf)
+
+        task.wait(0.03)
+
+        root.Anchored = false
+
+        return true
+
+    end
+
+    return false
+
+end
+
+
+
+-- ล็อคมุมกล้องผู้เล่นให้หันไปมองที่จุดตำแหน่งของไอเทม
+
+local function LockCameraToTarget(targetPos)
+
+    local cam = Workspace.CurrentCamera
+
+    if cam and targetPos then
+
+        -- ตั้งตำแหน่งกล้องให้อยู่ด้านหลังและสูงจากไอเทมเล็กน้อย แล้วหันหน้าตรงเข้าหาไอเทม
+
+        local camOffset = targetPos + Vector3.new(0, 3, 4)
+
+        cam.CFrame = CFrame.lookAt(camOffset, targetPos)
+
+    end
+
+end
+
+
+
+-- ตรวจสอบว่าไอเทมหายไปจากแมพหรือยัง
+
+local function IsItemGone(item)
+
+    if not item or not item.Parent or not item:IsDescendantOf(Workspace) then
+
+        return true
+
+    end
+
+    return false
+
+end
+
+
+
+-- ระบบกด E ค้างไว้จนสุดหรือจนกว่าของจะเข้าตัว
+
+local function HoldEAndCollect(item, anchor, prompt)
+
+    local startTime = tick()
+
+    local maxTimeout = _G.MaxWaitTime or 3.5
+
+    
+
+    -- ตรวจสอบระยะเวลา HoldDuration ของ ProximityPrompt (ถ้ามี)
+
+    local holdDuration = 1.0
+
+    if prompt and prompt.Parent then
+
+        prompt.Enabled = true
+
+        prompt.RequiresLineOfSight = false
+
+        prompt.MaxActivationDistance = 999
+
+        holdDuration = math.max(prompt.HoldDuration, 0.2)
+
+    end
+
+
+
+    -- เริ่มกดปุ่ม E ค้างไว้ (Key Down)
+
+    VIM:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+
+
+
+    -- วนลูปรอจนกว่าไอเทมจะหายไป หรือครบเวลาสูงสุด
+
+    while _G.AutoFarmItem and not IsItemGone(item) and (tick() - startTime < maxTimeout) do
+
+        -- รักษาตำแหน่งตัวละครและล็อคมุมกล้องไว้ที่ไอเทมตลอดเวลาที่กด E
+
+        local root = GetMyRoot()
+
+        if root and anchor and anchor.Parent then
+
+            root.AssemblyLinearVelocity = Vector3.zero
+
+            root.AssemblyAngularVelocity = Vector3.zero
+
+            LockCameraToTarget(anchor.Position)
+
+        end
+
+
+
+        -- ช่วยกระตุ้น ProximityPrompt หากรองรับ
+
+        if prompt and prompt.Parent and fireproximityprompt then
+
+            pcall(function()
+
+                fireproximityprompt(prompt)
+
+            end)
+
+        end
+
+
+
+        task.wait(0.05)
+
+    end
+
+
+
+    -- ปล่อยปุ่ม E (Key Up) ทันทีเมื่อเก็บสำเร็จหรือหมดเวลา
+
+    VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+
+end
+
+
+
+-- ค้นหาโฟลเดอร์ไอเทมใน Workspace (รองรับทั้ง Gameplay.Item และ Item)
+
+local function GetItemFolder()
+
+    local gameplay = Workspace:FindFirstChild("Gameplay")
+
+    if gameplay and gameplay:FindFirstChild("Item") then
+
+        return gameplay.Item
+
+    end
+
+    return Workspace:FindFirstChild("Item")
+
+end
+
+
+
+-- สแกนรายชื่อไอเทมทั้งหมดในแมพ
+
+local function ScanItemNames()
+
+    local names = {}
+
+    local it = GetItemFolder()
+
+    if it then
+
+        for _, item in ipairs(it:GetChildren()) do
+
+            if not table.find(names, item.Name) then
+
+                table.insert(names, item.Name)
+
+            end
+
+        end
+
+    end
+
+    table.sort(names)
+
+    return names
+
+end
+
+
+
+-- ค้นหาไอเทมที่ใกล้ผู้เล่นที่สุด
+
+local function GetNearestItem()
+
+    local it = GetItemFolder()
+
+    local root = GetMyRoot()
+
+    if not it or not root then return nil end
+
+
+
+    local hasFilters = false
+
+    for _, state in pairs(_G.SelectedItems) do
+
+        if state then hasFilters = true break end
+
+    end
+
+
+
+    local nearest = nil
+
+    local minDist = math.huge
+
+
+
+    for _, item in ipairs(it:GetChildren()) do
+
+        if item and item.Parent then
+
+            local isAllowed = true
+
+            if hasFilters and not _G.SelectedItems[item.Name] then
+
+                isAllowed = false
+
+            end
+
+
+
+            if isAllowed then
+
+                local anchor = item:FindFirstChild("PickupAnchor") or item:FindFirstChildWhichIsA("BasePart")
+
+                local targetPos = anchor and anchor.Position or item:GetPivot().Position
+
+                
+
+                if targetPos then
+
+                    local dist = (root.Position - targetPos).Magnitude
+
+                    if dist < minDist then
+
+                        minDist = dist
+
+                        nearest = {
+
+                            Instance = item,
+
+                            Anchor = anchor,
+
+                            Pivot = item:GetPivot(),
+
+                            Prompt = item:FindFirstChildWhichIsA("ProximityPrompt", true),
+
+                            Distance = dist
+
+                        }
+
+                    end
+
+                end
+
+            end
+
+        end
+
+    end
+
+
+
+    return nearest
+
+end
+
+
+
+--// UI SETUP - FARM TAB //--
+
+Tabs.Farm:AddParagraph({
+
+    Title = "Auto Farm Items (Teleport + Camera Lock)",
+
+    Content = "วาปไปหาไอเทม -> ล็อคมุมกล้องมองไอเทม -> กด E ค้างจนเก็บเข้าตัว 100%"
+
+})
+
+
+
+Tabs.Farm:AddToggle("AutoFarmToggle", {
+
+    Title = "Auto Farm Item (TP)",
+
+    Default = false,
+
+    Callback = function(Value)
+
+        _G.AutoFarmItem = Value
+
+        if not Value then
+
+            -- ปล่อยปุ่ม E ทันทีหากกดปิดสคริปต์กลางคัน
+
+            VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+
+        end
+
+    end
+
+})
+
+
+
+Tabs.Farm:AddSlider("MaxWaitSlider", {
+
+    Title = "Max Hold/Wait Timeout (sec)",
+
+    Description = "เวลากด E ค้างสูงสุดต่อ 1 ชิ้น (ถ้าเก็บไม่ได้จะข้ามไปชิ้นอื่น)",
+
+    Default = 3.5,
+
+    Min = 1,
+
+    Max = 8,
+
+    Rounding = 1,
+
+    Callback = function(Value)
+
+        _G.MaxWaitTime = Value
+
+    end
+
+})
+
+
+
+local ItemDropdown = Tabs.Farm:AddDropdown("ItemFilterDropdown", {
+
+    Title = "Select Items to Farm",
+
+    Description = "เลือกไอเทมที่ต้องการ (ถ้าไม่เลือกจะเก็บทุกอย่าง)",
+
+    Values = ScanItemNames(),
+
+    Multi = true,
+
+    Default = {},
+
+    Callback = function(Value)
+
+        _G.SelectedItems = Value
+
+    end
+
+})
+
+
+
+Tabs.Farm:AddButton({
+
+    Title = "Refresh Item List",
+
+    Description = "สแกนค้นหาไอเทมใหม่ในแมพ",
+
+    Callback = function()
+
+        local newItems = ScanItemNames()
+
+        ItemDropdown:SetValues(newItems)
+
+        Fluent:Notify({
+
+            Title = "Item Scanner",
+
+            Content = "พบไอเทมในแมพทั้งหมด " .. #newItems .. " ชนิด",
+
+            Duration = 3
+
+        })
+
+    end
+
+})
+
+
+
+--// UI SETUP - MAIN TAB //--
+
+Tabs.Main:AddSlider("WalkSpeedSlider", {
+
+    Title = "WalkSpeed",
+
+    Default = 16,
+
+    Min = 16,
+
+    Max = 150,
+
+    Rounding = 0,
+
+    Callback = function(Value)
+
+        local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+
+        if hum then hum.WalkSpeed = Value end
+
+    end
+
+})
+
+
+
+--// AUTO FARM WORKER LOOP //--
+
+task.spawn(function()
+
+    while true do
+
+        if _G.AutoFarmItem then
+
+            local target = GetNearestItem()
+
+            
+
+            if target and target.Instance and target.Instance.Parent then
+
+                local targetCF = target.Anchor and target.Anchor.CFrame or target.Pivot
+
+                local targetPos = targetCF.Position
+
+
+
+                -- 1. วาปไปเหนือไอเทมเล็กน้อย (ป้องกันตัวละครจมดิน)
+
+                TeleportToTarget(targetCF * CFrame.new(0, 1.5, 0))
+
+                
+
+                -- 2. ล็อคมุมกล้องไปที่ไอเทมทันทีหลังวาปถึง
+
+                LockCameraToTarget(targetPos)
+
+                task.wait(0.08) -- รอให้กล้องและตำแหน่งซิงค์กับเซิร์ฟเวอร์เสี้ยววินาที
+
+
+
+                -- 3. กด E ค้างจนสุดหรือจนกว่าไอเทมจะเข้าตัวชัวร์
+
+                HoldEAndCollect(target.Instance, target.Anchor, target.Prompt)
+
+                
+
+                task.wait(0.05)
+
+            else
+
+                task.wait(0.4)
+
+            end
+
+        else
+
+            task.wait(0.3)
+
+        end
+
+    end
+
+end)
+
+
+
+--// INIT MANAGERS //--
+
+SaveManager:SetLibrary(Fluent)
+
+InterfaceManager:SetLibrary(Fluent)
+
+SaveManager:SetIgnoreIndexes({})
+
+InterfaceManager:BuildInterfaceSection(Tabs.Settings)
+
+
+
+Window:SelectTab(1)
+
+SaveManager:LoadUserConfig()
+
+SaveManager:InitializeAutoSave(5)

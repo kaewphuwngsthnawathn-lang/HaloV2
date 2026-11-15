@@ -1,14 +1,16 @@
 --[[
     ========================================================================
-    GARDEN HORIZON / HALO ARCHIVES AUTO-COLLECT SYSTEM (PATHFINDING EDITION)
+    HALO ARCHIVES AUTO-COLLECT SYSTEM (MAP-WIDE & HALLOWEEN EVENT EDITION)
     ========================================================================
     - Author / Credits: Gemini
-    - Smart Pathfinding: Uses Roblox PathfindingService to walk around walls 
-      and obstacles naturally.
-    - Height & Ground Filter: Automatically skips items placed too high 
-      above the character or unreachable by pathfinding.
-    - Auto Hold E: Walks right up to the item, looks at it, and holds E 
-      automatically until collected.
+    - Map-Wide Scanner: Scans the entire map for items and Halloween event 
+      doors without distance limits.
+    - Item Name ESP: Displays floating name tags and distance over items 
+      and event doors across the map.
+    - Smart Pathfinding & Height Filter: Walks around obstacles to ground-level 
+      targets and skips unreachable/high targets.
+    - Halloween Door Handler: Automatically detects event doors, holds E 
+      to claim Candy, and puts claimed doors on cooldown so it moves on.
     ========================================================================
 ]]--
 
@@ -18,6 +20,7 @@ local InterfaceManager = loadstring(game:HttpGet("https://raw.githubusercontent.
 local httpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local PathfindingService = game:GetService("PathfindingService")
+local RunService = game:GetService("RunService")
 local VIM = game:GetService("VirtualInputManager")
 local Workspace = game:GetService("Workspace")
 
@@ -139,9 +142,9 @@ end
 --// WINDOW SETUP //--
 local Window = Fluent:CreateWindow({
     Title = "Gemini",
-    SubTitle = "🍋",
+    SubTitle = "🎃 Map-Wide Edition",
     TabWidth = 160,
-    Size = UDim2.fromOffset(580, 460),
+    Size = UDim2.fromOffset(580, 480),
     Acrylic = true,
     Theme = "Dark",
     MinimizeKey = Enum.KeyCode.LeftControl
@@ -187,16 +190,20 @@ setupCustomUI(Window)
 local Tabs = {
     Main = Window:AddTab({ Title = "Main", Icon = "home" }),
     Farm = Window:AddTab({ Title = "Farm", Icon = "sword" }),
+    ESP = Window:AddTab({ Title = "ESP & Visuals", Icon = "eye" }),
     Settings = Window:AddTab({ Title = "Settings", Icon = "settings" })
 }
 
 --// SETTINGS & STATE //--
 _G.AutoFarmItem = false
-_G.MaxHeightDiff = 6.5       -- ความสูงสูงสุดที่ยอมรับได้ (ถ้าไอเทมอยู่สูงกว่าตัวละครเกินค่านี้จะข้ามทันที)
-_G.HoldDurationFallback = 1.5
+_G.FarmHalloweenDoors = true
+_G.ShowItemESP = true
+_G.MaxHeightDiff = 7.5
+_G.HoldDurationFallback = 2.0
 _G.SelectedItems = {}
 
-local IgnoredItems = {}      -- เก็บรายการไอเทมที่เดินไปไม่ถึงชั่วคราว (ป้องกันเดินชนกำแพงซ้ำ)
+local IgnoredTargets = {}    -- เก็บรายการเป้าหมายที่ติดคูลดาวน์หรือเดินไปไม่ถึงชั่วคราว
+local ActiveESPs = {}        -- เก็บ BillboardGui ของ ESP
 
 local function GetCharacterParts()
     local char = player.Character
@@ -213,7 +220,6 @@ local function StopWalking()
     VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
 end
 
--- หันกล้องมองไอเทม 1 ครั้งแบบไม่ล็อคค้าง
 local function SnapCameraToTarget(targetPos)
     local cam = Workspace.CurrentCamera
     if cam and targetPos then
@@ -225,94 +231,242 @@ local function SnapCameraToTarget(targetPos)
     end
 end
 
-local function IsItemGone(item)
-    if not item or not item.Parent or not item:IsDescendantOf(Workspace) then
+local function IsTargetGone(targetObj)
+    if not targetObj or not targetObj.Parent or not targetObj:IsDescendantOf(Workspace) then
         return true
     end
     return false
 end
 
-local function GetItemFolder()
+-- ตรวจสอบว่าเป็นประตูอีเวนต์ฮาโลวีนหรือไม่
+local function IsHalloweenDoor(obj, prompt)
+    local combinedText = (obj.Name .. " " .. (prompt and (prompt.ObjectText .. " " .. prompt.ActionText) or "")):lower()
+    if combinedText:find("door") or combinedText:find("halloween") or combinedText:find("candy") or combinedText:find("trick") or combinedText:find("knock") then
+        return true
+    end
+    return false
+end
+
+-- สแกนหาไอเทมและประตูฮาโลวีนครอบคลุมทั้งแมพ (ไม่จำกัดระยะ)
+local function GetAllMapTargets()
+    local targets = {}
+    local seen = {}
+
+    local function registerTarget(obj, isDoorOverride)
+        if not obj or not obj.Parent or seen[obj] then return end
+        seen[obj] = true
+
+        local prompt = obj:FindFirstChildWhichIsA("ProximityPrompt", true)
+        local anchor = obj:FindFirstChild("PickupAnchor") 
+            or (prompt and prompt.Parent and prompt.Parent:IsA("BasePart") and prompt.Parent)
+            or (obj:IsA("BasePart") and obj)
+            or obj:FindFirstChildWhichIsA("BasePart", true)
+
+        if anchor then
+            local isDoor = isDoorOverride or IsHalloweenDoor(obj, prompt)
+            local displayName = obj.Name
+            if isDoor then
+                displayName = "[🎃 Event Door] " .. obj.Name
+            end
+
+            table.insert(targets, {
+                Instance = obj,
+                Name = obj.Name,
+                DisplayName = displayName,
+                Anchor = anchor,
+                Prompt = prompt,
+                IsDoor = isDoor
+            })
+        end
+    end
+
+    -- 1. ค้นหาในโฟลเดอร์ไอเทมหลักของแมพ (ทั้งแมพ)
+    local itemFolders = {}
     local gameplay = Workspace:FindFirstChild("Gameplay")
     if gameplay and gameplay:FindFirstChild("Item") then
-        return gameplay.Item
+        table.insert(itemFolders, gameplay.Item)
     end
-    return Workspace:FindFirstChild("Item")
+    if Workspace:FindFirstChild("Item") then
+        table.insert(itemFolders, Workspace.Item)
+    end
+    if Workspace:FindFirstChild("Items") then
+        table.insert(itemFolders, Workspace.Items)
+    end
+
+    for _, folder in ipairs(itemFolders) do
+        for _, item in ipairs(folder:GetChildren()) do
+            registerTarget(item, false)
+        end
+    end
+
+    -- 2. ค้นหาประตูอีเวนต์ฮาโลวีนหรือไอเทมที่มี ProximityPrompt ทั่วทั้ง Workspace (ระยะไกลทั้งแมพ)
+    for _, desc in ipairs(Workspace:GetDescendants()) do
+        if desc:IsA("ProximityPrompt") and desc.Parent then
+            -- ข้ามตัวละครผู้เล่น
+            local modelAncestor = desc:FindFirstAncestorOfClass("Model")
+            if modelAncestor and Players:GetPlayerFromCharacter(modelAncestor) then
+                continue
+            end
+
+            local targetContainer = modelAncestor or desc.Parent
+            if not seen[targetContainer] then
+                if IsHalloweenDoor(targetContainer, desc) then
+                    registerTarget(targetContainer, true)
+                end
+            end
+        end
+    end
+
+    return targets
 end
 
 local function ScanItemNames()
     local names = {}
-    local it = GetItemFolder()
-    if it then
-        for _, item in ipairs(it:GetChildren()) do
-            if not table.find(names, item.Name) then
-                table.insert(names, item.Name)
-            end
+    local allTargets = GetAllMapTargets()
+    for _, t in ipairs(allTargets) do
+        if not table.find(names, t.Name) then
+            table.insert(names, t.Name)
         end
     end
     table.sort(names)
     return names
 end
 
+--// ระบบ ESP แสดงชื่อไอเทมระยะไกลทั้งแมพ //--
+local function ClearAllESP()
+    for obj, gui in pairs(ActiveESPs) do
+        if gui and gui.Parent then
+            gui:Destroy()
+        end
+    end
+    table.clear(ActiveESPs)
+end
+
+local function UpdateItemESP()
+    if not _G.ShowItemESP then
+        ClearAllESP()
+        return
+    end
+
+    local _, root, _ = GetCharacterParts()
+    local allTargets = GetAllMapTargets()
+    local validInstances = {}
+
+    for _, t in ipairs(allTargets) do
+        if t.Instance and t.Instance.Parent and t.Anchor and t.Anchor.Parent then
+            validInstances[t.Instance] = true
+            local dist = root and math.floor((root.Position - t.Anchor.Position).Magnitude) or 0
+
+            local billboard = ActiveESPs[t.Instance]
+            if not billboard or not billboard.Parent then
+                billboard = Instance.new("BillboardGui")
+                billboard.Name = "GeminiItemESP"
+                billboard.AlwaysOnTop = true
+                billboard.Size = UDim2.new(0, 200, 0, 40)
+                billboard.StudsOffset = Vector3.new(0, 2.5, 0)
+                billboard.MaxDistance = math.huge -- มองเห็นได้ไกลทั้งแมพ
+                billboard.Adornee = t.Anchor
+                billboard.Parent = t.Anchor
+
+                local label = Instance.new("TextLabel")
+                label.Name = "Title"
+                label.Parent = billboard
+                label.BackgroundTransparency = 1
+                label.Size = UDim2.new(1, 0, 1, 0)
+                label.Font = Enum.Font.GothamBold
+                label.TextSize = 13
+                label.TextStrokeTransparency = 0.2
+                label.TextStrokeColor3 = Color3.new(0, 0, 0)
+                label.TextColor3 = t.IsDoor and Color3.fromRGB(255, 165, 0) or Color3.fromRGB(100, 255, 150)
+
+                ActiveESPs[t.Instance] = billboard
+            end
+
+            local label = billboard:FindFirstChild("Title")
+            if label then
+                local statusTag = IgnoredTargets[t.Instance] and " [Cooldown]" or ""
+                label.Text = string.format("%s\n[%dm]%s", t.DisplayName, dist, statusTag)
+            end
+        end
+    end
+
+    -- ลบ ESP ของไอเทมที่ถูกเก็บไปแล้ว
+    for obj, gui in pairs(ActiveESPs) do
+        if not validInstances[obj] or not obj.Parent then
+            if gui and gui.Parent then gui:Destroy() end
+            ActiveESPs[obj] = nil
+        end
+    end
+end
+
+-- อัปเดตป้ายชื่อ ESP ทุกๆ 0.5 วินาที
+task.spawn(function()
+    while true do
+        pcall(UpdateItemESP)
+        task.wait(0.5)
+    end
+end)
+
 -- ตรวจสอบว่าไอเทมอยู่บนพื้นและไม่สูงเกินตัวละคร
-local function IsItemOnGround(rootPos, itemPos)
-    local heightDiff = itemPos.Y - rootPos.Y
-    -- ถ้าอยู่สูงเกินกำหนด (เช่น บนหลังคา บนต้นไม้ หรือชั้นบน) ให้ปล่อยผ่านเลย
-    if heightDiff > (_G.MaxHeightDiff or 6.5) then
+local function IsTargetOnGround(rootPos, targetPos)
+    local heightDiff = targetPos.Y - rootPos.Y
+    if heightDiff > (_G.MaxHeightDiff or 7.5) then
         return false
     end
-    -- ถ้าอยู่ต่ำกว่าตัวละครมากเกินไป (เช่น ใต้แมพ) ก็ข้ามเช่นกัน
     if heightDiff < -15 then
         return false
     end
     return true
 end
 
--- ค้นหาไอเทมที่ใกล้ที่สุดและคำนวณเส้นทางได้จริง
-local function GetBestReachableItem()
-    local it = GetItemFolder()
+-- ค้นหาเป้าหมายที่ดีที่สุดจากทั้งแมพและคำนวณเส้นทางเดิน
+local function GetBestReachableTarget()
     local _, root, _ = GetCharacterParts()
-    if not it or not root then return nil end
+    if not root then return nil end
 
     local hasFilters = false
     for _, state in pairs(_G.SelectedItems) do
         if state then hasFilters = true break end
     end
 
+    local allTargets = GetAllMapTargets()
     local candidates = {}
 
-    for _, item in ipairs(it:GetChildren()) do
-        if item and item.Parent and not IgnoredItems[item] then
+    for _, t in ipairs(allTargets) do
+        if t.Instance and t.Instance.Parent and not IgnoredTargets[t.Instance] then
             local isAllowed = true
-            if hasFilters and not _G.SelectedItems[item.Name] then
-                isAllowed = false
+
+            if t.IsDoor then
+                if not _G.FarmHalloweenDoors then
+                    isAllowed = false
+                end
+                -- ถ้าประตูถูกปิดใช้งาน Prompt ชั่วคราว (กดรับ Candy ไปแล้ว) ให้ข้าม
+                if t.Prompt and not t.Prompt.Enabled then
+                    isAllowed = false
+                end
+            else
+                if hasFilters and not _G.SelectedItems[t.Name] then
+                    isAllowed = false
+                end
             end
 
-            if isAllowed then
-                local anchor = item:FindFirstChild("PickupAnchor") or item:FindFirstChildWhichIsA("BasePart")
-                local targetPos = anchor and anchor.Position or item:GetPivot().Position
-                
-                -- กรองเฉพาะไอเทมที่อยู่ระดับพื้น (ไม่สูงเกินตัวละคร)
-                if targetPos and IsItemOnGround(root.Position, targetPos) then
-                    local dist = (root.Position - targetPos).Magnitude
-                    table.insert(candidates, {
-                        Instance = item,
-                        Anchor = anchor,
-                        Position = targetPos,
-                        Prompt = item:FindFirstChildWhichIsA("ProximityPrompt", true),
-                        Distance = dist
-                    })
+            if isAllowed and t.Anchor and t.Anchor.Parent then
+                local targetPos = t.Anchor.Position
+                if IsTargetOnGround(root.Position, targetPos) then
+                    t.Position = targetPos
+                    t.Distance = (root.Position - targetPos).Magnitude
+                    table.insert(candidates, t)
                 end
             end
         end
     end
 
-    -- เรียงลำดับจากใกล้ไปไกล
+    -- เรียงลำดับจากใกล้ไปไกล (ครอบคลุมระยะไกลทั้งแมพ)
     table.sort(candidates, function(a, b)
         return a.Distance < b.Distance
     end)
 
-    -- คำนวณเส้นทาง (Pathfinding) เพื่อเช็คว่ามีทางเดินไปได้จริงหรือไม่
+    -- คำนวณเส้นทาง (Pathfinding) เพื่อหาเส้นทางเดินที่ไปได้จริง
     for _, candidate in ipairs(candidates) do
         local path = PathfindingService:CreatePath({
             AgentRadius = 2.0,
@@ -329,10 +483,10 @@ local function GetBestReachableItem()
             candidate.Waypoints = path:GetWaypoints()
             return candidate
         else
-            -- หากคำนวณเส้นทางไม่ได้ (ไม่มีทางไป) ให้ข้ามชิ้นนี้ชั่วคราว 15 วินาที
-            IgnoredItems[candidate.Instance] = true
-            task.delay(15, function()
-                IgnoredItems[candidate.Instance] = nil
+            -- หากยังหาทางเดินตรงๆ ไม่เจอ ให้ข้ามชั่วคราว 12 วินาทีแล้วลองสแกนใหม่
+            IgnoredTargets[candidate.Instance] = true
+            task.delay(12, function()
+                IgnoredTargets[candidate.Instance] = nil
             end)
         end
     end
@@ -340,13 +494,13 @@ local function GetBestReachableItem()
     return nil
 end
 
--- เดินตามเส้นทางที่คำนวณไว้จนถึงไอเทม
+-- เดินตามเส้นทางที่คำนวณไว้จนถึงเป้าหมาย
 local function WalkToTarget(target)
     local waypoints = target.Waypoints
     if not waypoints or #waypoints == 0 then return false end
 
     for i = 2, #waypoints do
-        if not _G.AutoFarmItem or IsItemGone(target.Instance) then
+        if not _G.AutoFarmItem or IsTargetGone(target.Instance) then
             return false
         end
 
@@ -360,28 +514,26 @@ local function WalkToTarget(target)
 
         hum:MoveTo(wp.Position)
 
-        -- รอจนกว่าจะเดินถึงจุด Waypoint ย่อย หรือเข้าใกล้ไอเทมในระยะเก็บได้แล้ว
         local wpStart = tick()
-        while _G.AutoFarmItem and not IsItemGone(target.Instance) do
+        while _G.AutoFarmItem and not IsTargetGone(target.Instance) do
             _, root, hum = GetCharacterParts()
             if not root or not hum then return false end
 
-            local currentItemPos = (target.Anchor and target.Anchor.Parent and target.Anchor.Position) or target.Position
-            if (root.Position - currentItemPos).Magnitude <= 5.5 then
-                return true -- ถึงระยะเก็บไอเทมแล้ว
+            local currentPos = (target.Anchor and target.Anchor.Parent and target.Anchor.Position) or target.Position
+            if (root.Position - currentPos).Magnitude <= 6.0 then
+                return true -- ถึงระยะกดเก็บแล้ว
             end
 
             local distToWp = (Vector3.new(root.Position.X, 0, root.Position.Z) - Vector3.new(wp.Position.X, 0, wp.Position.Z)).Magnitude
             if distToWp <= 3.0 then
-                break -- ถึงจุด Waypoint นี้แล้ว ไปจุดต่อไป
+                break
             end
 
-            -- ป้องกันเดินติดสิ่งกีดขวางนานเกินไป (เกิน 2.5 วิต่อ 1 ก้าว ให้กระโดดหรือยกเลิก)
             if tick() - wpStart > 2.5 then
                 hum.Jump = true
-                if tick() - wpStart > 4.0 then
-                    IgnoredItems[target.Instance] = true
-                    task.delay(15, function() IgnoredItems[target.Instance] = nil end)
+                if tick() - wpStart > 4.5 then
+                    IgnoredTargets[target.Instance] = true
+                    task.delay(12, function() IgnoredTargets[target.Instance] = nil end)
                     return false
                 end
             end
@@ -391,51 +543,56 @@ local function WalkToTarget(target)
     end
 
     local _, root = GetCharacterParts()
-    local finalItemPos = (target.Anchor and target.Anchor.Parent and target.Anchor.Position) or target.Position
-    if root and (root.Position - finalItemPos).Magnitude <= 7.0 then
+    local finalPos = (target.Anchor and target.Anchor.Parent and target.Anchor.Position) or target.Position
+    if root and (root.Position - finalPos).Magnitude <= 7.5 then
         return true
     end
 
     return false
 end
 
--- หยุดเดิน หันมอง และกด E เก็บไอเทมจนสุด
-local function CollectItemByWalking(target)
-    local item = target.Instance
+-- หยุดเดิน หันมอง และกด E ค้างเพื่อเก็บไอเทมหรือเปิดประตูรับ Candy
+local function CollectTarget(target)
+    local obj = target.Instance
     local _, root, hum = GetCharacterParts()
-    if not root or not hum or not item or not item.Parent then return end
+    if not root or not hum or not obj or not obj.Parent then return end
 
-    -- หยุดเดินให้นิ่ง
     hum:MoveTo(root.Position)
 
-    local targetPos = (target.Anchor and target.Anchor.Parent and target.Anchor.Position) or item:GetPivot().Position
-    
-    -- หันตัวละครและกล้องไปทางไอเทม
+    local targetPos = (target.Anchor and target.Anchor.Parent and target.Anchor.Position) or obj:GetPivot().Position
     root.CFrame = CFrame.lookAt(root.Position, Vector3.new(targetPos.X, root.Position.Y, targetPos.Z))
     SnapCameraToTarget(targetPos)
     task.wait(0.15)
 
-    local prompt = target.Prompt or item:FindFirstChildWhichIsA("ProximityPrompt", true)
+    local prompt = target.Prompt or obj:FindFirstChildWhichIsA("ProximityPrompt", true)
     if prompt then
-        prompt.Enabled = true
+        -- สำหรับประตูอีเวนต์ จะไม่บังคับเปิด Enabled ถ้าประตูติดคูลดาวน์จากเซิร์ฟเวอร์อยู่
+        if not target.IsDoor then
+            prompt.Enabled = true
+        end
         prompt.RequiresLineOfSight = false
         prompt.MaxActivationDistance = 999
     end
 
-    local holdTime = _G.HoldDurationFallback or 1.5
+    local holdTime = _G.HoldDurationFallback or 2.0
     if prompt and prompt.HoldDuration > 0 then
-        holdTime = prompt.HoldDuration + 0.45
+        holdTime = prompt.HoldDuration + 0.5
     end
 
-    -- กด E ค้างไว้จนสุดหลอด
+    -- เริ่มกดปุ่ม E ค้างไว้จนสุดหลอด
     VIM:SendKeyEvent(true, Enum.KeyCode.E, false, game)
     if prompt and prompt.InputHoldBegin then
         pcall(function() prompt:InputHoldBegin() end)
     end
 
     local attemptStart = tick()
-    while _G.AutoFarmItem and not IsItemGone(item) and (tick() - attemptStart < holdTime + 1.5) do
-        if fireproximityprompt and prompt then
+    while _G.AutoFarmItem and not IsTargetGone(obj) and (tick() - attemptStart < holdTime + 1.0) do
+        -- หากเป็นประตูอีเวนต์และ Prompt ถูกปิด (แปลว่ากดรับ Candy สำเร็จแล้ว) ให้หยุดกดทันที
+        if target.IsDoor and prompt and not prompt.Enabled then
+            break
+        end
+
+        if fireproximityprompt and prompt and prompt.Enabled then
             pcall(function() fireproximityprompt(prompt) end)
         end
         task.wait(0.1)
@@ -446,33 +603,50 @@ local function CollectItemByWalking(target)
     if prompt and prompt.InputHoldEnd then
         pcall(function() prompt:InputHoldEnd() end)
     end
+
+    -- หากเป็นประตูอีเวนต์ฮาโลวีน ให้ติดคูลดาวน์ประตูบานนี้ไว้ 45 วินาที เพื่อเดินไปหาไอเทมหรือประตูบานอื่นต่อ
+    if target.IsDoor then
+        IgnoredTargets[obj] = true
+        task.delay(45, function()
+            IgnoredTargets[obj] = nil
+        end)
+    end
 end
 
 --// UI SETUP - FARM TAB //--
 Tabs.Farm:AddParagraph({
-    Title = "Smart Walk & Auto Collect (Gemini)",
-    Content = "คำนวณเส้นทางเดินไปเก็บไอเทมบนพื้นอัตโนมัติ (ข้ามไอเทมที่อยู่สูงหรือทางตัน)"
+    Title = "Map-Wide Auto Walk & Halloween Farm",
+    Content = "ตรวจจับไอเทมและประตูฮาโลวีนทั้งแมพ เดินไปหาและกด E ค้างอัตโนมัติ"
 })
 
 Tabs.Farm:AddToggle("AutoFarmToggle", {
-    Title = "Auto Walk & Farm Item",
+    Title = "Auto Walk & Farm (All Map)",
     Default = false,
     Callback = function(Value)
         _G.AutoFarmItem = Value
         if not Value then
             StopWalking()
         else
-            table.clear(IgnoredItems)
+            table.clear(IgnoredTargets)
         end
+    end
+})
+
+Tabs.Farm:AddToggle("HalloweenDoorToggle", {
+    Title = "Auto Farm Halloween Doors (Candy)",
+    Description = "เดินไปกด E ค้างที่ประตูอีเวนต์ฮาโลวีนเพื่อรับ Candy อัตโนมัติ",
+    Default = true,
+    Callback = function(Value)
+        _G.FarmHalloweenDoors = Value
     end
 })
 
 Tabs.Farm:AddSlider("MaxHeightSlider", {
     Title = "Max Item Height (studs)",
-    Description = "ความสูงสูงสุดของไอเทมที่จะเดินไปเก็บ (สูงกว่านี้จะปล่อยผ่าน)",
-    Default = 6.5,
+    Description = "ข้ามไอเทมที่อยู่สูงเกินกว่าค่านี้ (เก็บเฉพาะบนพื้น)",
+    Default = 7.5,
     Min = 2.0,
-    Max = 20.0,
+    Max = 25.0,
     Rounding = 1,
     Callback = function(Value)
         _G.MaxHeightDiff = Value
@@ -481,10 +655,10 @@ Tabs.Farm:AddSlider("MaxHeightSlider", {
 
 Tabs.Farm:AddSlider("HoldTimeSlider", {
     Title = "Hold E Duration (sec)",
-    Description = "ระยะเวลากด E ค้างไว้ตอนถึงตัวไอเทม",
-    Default = 1.5,
+    Description = "ระยะเวลากด E ค้างไว้ (เผื่อเวลาสำหรับประตูฮาโลวีน)",
+    Default = 2.0,
     Min = 0.5,
-    Max = 5.0,
+    Max = 6.0,
     Rounding = 1,
     Callback = function(Value)
         _G.HoldDurationFallback = Value
@@ -493,7 +667,7 @@ Tabs.Farm:AddSlider("HoldTimeSlider", {
 
 local ItemDropdown = Tabs.Farm:AddDropdown("ItemFilterDropdown", {
     Title = "Select Items to Farm",
-    Description = "เลือกไอเทมที่ต้องการ (ถ้าไม่เลือกจะเก็บทุกอย่างที่อยู่บนพื้น)",
+    Description = "เลือกเฉพาะไอเทมที่ต้องการ (ไม่เลือก = เก็บทุกอย่างทั้งแมพ)",
     Values = ScanItemNames(),
     Multi = true,
     Default = {},
@@ -503,24 +677,39 @@ local ItemDropdown = Tabs.Farm:AddDropdown("ItemFilterDropdown", {
 })
 
 Tabs.Farm:AddButton({
-    Title = "Refresh Item List",
-    Description = "สแกนค้นหาไอเทมใหม่ในแมพและล้างรายการที่ข้าม",
+    Title = "Refresh Map Scanner",
+    Description = "สแกนหาไอเทม/ประตูใหม่ทั้งแมพ และรีเซ็ตคูลดาวน์",
     Callback = function()
-        table.clear(IgnoredItems)
+        table.clear(IgnoredTargets)
         local newItems = ScanItemNames()
         ItemDropdown:SetValues(newItems)
         Fluent:Notify({
-            Title = "Gemini Scanner",
-            Content = "พบไอเทมในแมพทั้งหมด " .. #newItems .. " ชนิด",
+            Title = "Gemini Map Scanner",
+            Content = "ตรวจพบเป้าหมายในแมพทั้งหมด " .. #newItems .. " ชนิด",
             Duration = 3
         })
+    end
+})
+
+--// UI SETUP - ESP TAB //--
+Tabs.ESP:AddToggle("ItemESPToggle", {
+    Title = "Show Item & Door Names (ESP)",
+    Description = "แสดงชื่อและระยะห่างของไอเทมและประตูฮาโลวีนทั่วทั้งแมพ",
+    Default = true,
+    Callback = function(Value)
+        _G.ShowItemESP = Value
+        if not Value then
+            ClearAllESP()
+        else
+            UpdateItemESP()
+        end
     end
 })
 
 --// UI SETUP - MAIN TAB //--
 Tabs.Main:AddSlider("WalkSpeedSlider", {
     Title = "WalkSpeed",
-    Description = "ปรับความเร็วในการเดินหาไอเทม",
+    Description = "ปรับความเร็วในการเดินหาไอเทมทั่วแมพ",
     Default = 16,
     Min = 16,
     Max = 100,
@@ -535,13 +724,13 @@ Tabs.Main:AddSlider("WalkSpeedSlider", {
 task.spawn(function()
     while true do
         if _G.AutoFarmItem then
-            local target = GetBestReachableItem()
+            local target = GetBestReachableTarget()
             
-            if target and target.Instance and not IsItemGone(target.Instance) then
+            if target and target.Instance and not IsTargetGone(target.Instance) then
                 local reached = WalkToTarget(target)
                 
-                if reached and _G.AutoFarmItem and not IsItemGone(target.Instance) then
-                    CollectItemByWalking(target)
+                if reached and _G.AutoFarmItem and not IsTargetGone(target.Instance) then
+                    CollectTarget(target)
                 end
                 task.wait(0.1)
             else

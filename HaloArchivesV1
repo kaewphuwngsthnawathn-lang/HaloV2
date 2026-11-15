@@ -1,1 +1,1243 @@
+local _ENV = (getgenv or getrenv or getfenv)()
+
+local Fluent = loadstring(game:HttpGet(
+    "https://raw.githubusercontent.com/discoart/FluentPlus/refs/heads/main/Beta.lua"
+))()
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+
+local Player = Players.LocalPlayer
+
+local Items, Walker, Collector = {}, {}, {}
+
+do
+    local CachedFolder = nil
+    local CachedRegistry = nil
+    local CachedChannel = nil
+    local CachedClient = nil
+
+    function Items:GetShared(Name)
+        local Shared = ReplicatedStorage:FindFirstChild("Shared")
+
+        if not Shared then
+            return nil
+        end
+
+        local Folder = Shared:FindFirstChild(Name)
+
+        if not Folder then
+            return nil
+        end
+
+        return Folder
+    end
+
+    function Items:GetFolder()
+        local Cached = CachedFolder
+
+        if Cached and Cached.Parent then
+            return Cached
+        end
+
+        CachedFolder = nil
+
+        local Gameplay = Workspace:FindFirstChild("Gameplay")
+
+        if not Gameplay then
+            return nil
+        end
+
+        local Folder = Gameplay:FindFirstChild("Item")
+
+        if not Folder then
+            return nil
+        end
+
+        CachedFolder = Folder
+
+        return CachedFolder
+    end
+
+    function Items:GetRegistry()
+        if CachedRegistry then
+            return CachedRegistry
+        end
+
+        local Assets = self:GetShared("Assets")
+        local Registry = Assets and Assets:FindFirstChild("AssetRegistry")
+
+        if not Registry then
+            return nil
+        end
+
+        local Success, Result = pcall(require, Registry)
+
+        if not Success or type(Result) ~= "table" then
+            return nil
+        end
+
+        CachedRegistry = Result
+
+        return CachedRegistry
+    end
+
+    function Items:GetChannel()
+        if CachedChannel then
+            return CachedChannel
+        end
+
+        local Network = self:GetShared("Network")
+        local Bridge = Network and Network:FindFirstChild("RemoteBridge")
+
+        if not Bridge then
+            return nil
+        end
+
+        local Success, Result = pcall(require, Bridge)
+
+        if not Success or type(Result) ~= "table" then
+            return nil
+        end
+
+        local Ok, Channel = pcall(function()
+            return Result.Channel("ItemPickup")
+        end)
+
+        if not Ok or not Channel then
+            return nil
+        end
+
+        CachedChannel = Channel
+
+        return CachedChannel
+    end
+
+    function Items:GetClient()
+        if CachedClient then
+            return CachedClient
+        end
+
+        local AutoHarvest = self:GetShared("AutoHarvest")
+        local ClientModule = AutoHarvest and AutoHarvest:FindFirstChild("DroppedItemPickupClient")
+
+        if not ClientModule then
+            return nil
+        end
+
+        local Success, Result = pcall(require, ClientModule)
+
+        if not Success or type(Result) ~= "table" then
+            return nil
+        end
+
+        CachedClient = Result
+
+        return CachedClient
+    end
+
+    function Items:IsValid(Drop)
+        if not Drop or not Drop.Parent then
+            return false
+        end
+
+        if Drop.Parent ~= self:GetFolder() then
+            return false
+        end
+
+        if Drop:GetAttribute("PickupCollected") then
+            return false
+        end
+
+        return typeof(Drop:GetAttribute("UUID")) == "string"
+    end
+
+    function Items:GetPart(Drop)
+        local Anchor = Drop:FindFirstChild("PickupAnchor", true)
+
+        if Anchor and Anchor:IsA("BasePart") then
+            return Anchor
+        end
+
+        if Drop:IsA("Model") then
+            return Drop.PrimaryPart or Drop:FindFirstChildWhichIsA("BasePart", true)
+        end
+
+        if Drop:IsA("BasePart") then
+            return Drop
+        end
+
+        return nil
+    end
+
+    function Items:Count()
+        local Folder = self:GetFolder()
+
+        if not Folder then
+            return 0
+        end
+
+        local Total = 0
+
+        for _, Drop in Folder:GetChildren() do
+            if self:IsValid(Drop) then
+                Total = Total + 1
+            end
+        end
+
+        return Total
+    end
+end
+
+do
+    local CachedParts = {}
+
+    local function GroundParams()
+        local Params = RaycastParams.new()
+
+        Params.FilterType = Enum.RaycastFilterType.Exclude
+        Params.FilterDescendantsInstances = { Player.Character }
+        Params.IgnoreWater = true
+        Params.RespectCanCollide = true
+
+        return Params
+    end
+
+    function Walker:GetHumanoid()
+        local Character = Player.Character
+
+        return Character and Character:FindFirstChildOfClass("Humanoid")
+    end
+
+    function Walker:GetRoot()
+        local Character = Player.Character
+
+        return Character and Character:FindFirstChild("HumanoidRootPart")
+    end
+
+    function Walker:GetClearance()
+        local Humanoid = self:GetHumanoid()
+        local Root = self:GetRoot()
+
+        if not Humanoid or not Root then
+            return 3
+        end
+
+        local Clearance = Humanoid.HipHeight + Root.Size.Y * 0.5
+
+        if Humanoid.RigType == Enum.HumanoidRigType.R6 then
+            Clearance = Clearance + 1.5
+        end
+
+        return math.max(2, Clearance)
+    end
+
+    function Walker:Sample(X, Z, RefY)
+        local Params = GroundParams()
+        local Clearance = self:GetClearance()
+        local Head = RefY + Clearance + 2
+
+        local Result = Workspace:Raycast(
+            Vector3.new(X, Head, Z),
+            Vector3.new(0, -(Clearance + 40), 0),
+            Params
+        )
+
+        if Result and Result.Normal.Y >= 0.55 then
+            return Result.Position.Y
+        end
+
+        local Deep = Workspace:Raycast(
+            Vector3.new(X, Head + 120, Z),
+            Vector3.new(0, -400, 0),
+            Params
+        )
+
+        if Deep and Deep.Normal.Y >= 0.55 and Deep.Position.Y < RefY - 1 then
+            return Deep.Position.Y
+        end
+
+        return nil
+    end
+
+    function Walker:GetGroundY(Position, Fallback)
+        local Root = self:GetRoot()
+
+        if not Root then
+            return Fallback
+        end
+
+        local Ref = Fallback
+
+        if type(Ref) ~= "number" then
+            Ref = Root.Position.Y
+        end
+
+        local Clearance = self:GetClearance()
+        local Best = self:Sample(Position.X, Position.Z, Ref)
+
+        if not Best then
+            Best = self:Sample(Root.Position.X, Root.Position.Z, Ref)
+        end
+
+        if not Best then
+            return Fallback
+        end
+
+        return Best + Clearance
+    end
+
+    function Walker:GetSpeed()
+        local Humanoid = self:GetHumanoid()
+        local Speed = 16
+
+        if Humanoid then
+            Speed = math.max(Humanoid.WalkSpeed, 1)
+        end
+
+        return Speed * self.Multiplier
+    end
+
+    function Walker:IsBusy()
+        return self.Busy == true
+    end
+
+    function Walker:SetNoclip(Value)
+        local Character = Player.Character
+
+        if not Character then
+            return
+        end
+
+        if Value then
+            for _, Part in Character:GetDescendants() do
+                if Part:IsA("BasePart") and Part.CanCollide then
+                    CachedParts[ Part ] = true
+
+                    Part.CanCollide = false
+                end
+            end
+
+            return
+        end
+
+        for Part in CachedParts do
+            if Part.Parent then
+                Part.CanCollide = true
+            end
+        end
+
+        table.clear(CachedParts)
+    end
+
+    function Walker:Stop()
+        local Character = Player.Character
+
+        if not Character then
+            return
+        end
+
+        local Humanoid = Character:FindFirstChildOfClass("Humanoid")
+        local Root = Character:FindFirstChild("HumanoidRootPart")
+
+        if Humanoid then
+            Humanoid:Move(Vector3.new(0, 0, 0), false)
+        end
+
+        if Root then
+            Root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+            Root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+        end
+    end
+
+    function Walker:Cancel()
+        self.Busy = false
+        self.WantDetour = false
+        self.LastTick = 0
+
+        self:Stop()
+        self:SetNoclip(false)
+    end
+
+    function Walker:SnapToGround()
+        local Root = self:GetRoot()
+
+        if not Root then
+            return false
+        end
+
+        local Clearance = self:GetClearance()
+        local Ground = self:Sample(Root.Position.X, Root.Position.Z, Root.Position.Y)
+
+        if not Ground then
+            return false
+        end
+
+        local TargetY = Ground + Clearance
+
+        if math.abs(TargetY - Root.Position.Y) > 8 then
+            return false
+        end
+
+        Root.CFrame = CFrame.new(Vector3.new(Root.Position.X, TargetY, Root.Position.Z)) * (Root.CFrame - Root.Position)
+        Root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+
+        return true
+    end
+
+    function Walker:Settle(Seconds)
+        self:Stop()
+
+        local Finish = os.clock() + (Seconds or 0.25)
+
+        while os.clock() < Finish do
+            self:Stop()
+
+            RunService.Heartbeat:Wait()
+        end
+    end
+
+    function Walker:Step(Target, StopDistance)
+        local Character = Player.Character
+        local Root = Character and Character:FindFirstChild("HumanoidRootPart")
+        local Humanoid = self:GetHumanoid()
+
+        if not Root or not Humanoid then
+            return "abort"
+        end
+
+        local Now = os.clock()
+        local Elapsed = math.clamp(Now - (self.LastTick or Now), 0.001, 0.1)
+
+        self.LastTick = Now
+
+        local Here = Root.Position
+        local Clearance = self:GetClearance()
+        local Delta = Vector3.new(Target.X - Here.X, 0, Target.Z - Here.Z)
+        local Distance = Delta.Magnitude
+
+        if Distance <= StopDistance then
+            return "done"
+        end
+
+        local Direction = Delta.Unit
+        local Budget = self:GetSpeed() * Elapsed
+        local Travel = math.min(Budget, Distance - StopDistance)
+        local Flat = Here + Direction * Travel
+
+        local Ahead = self:Sample(Flat.X, Flat.Z, Here.Y)
+
+        if not Ahead then
+            Ahead = self:Sample(Here.X + Direction.X * 1.5, Here.Z + Direction.Z * 1.5, Here.Y)
+        end
+
+        if not Ahead then
+            return "blocked"
+        end
+
+        local Required = (Ahead + Clearance) - Here.Y
+
+        if Required > self.MaxClimb then
+            return "blocked"
+        end
+
+        local NextY
+
+        if Required >= 0 then
+            NextY = Here.Y + math.min(Required, math.max(self.RiseSpeed * Elapsed, 0.08))
+        else
+            NextY = Here.Y - math.min(-Required, math.max(self.FallSpeed * Elapsed, 0.1))
+        end
+
+        local Dx = Flat.X - Here.X
+        local Dz = Flat.Z - Here.Z
+        local Dy = NextY - Here.Y
+        local Magnitude = math.sqrt(Dx * Dx + Dy * Dy + Dz * Dz)
+
+        if Magnitude > Budget and Magnitude > 0.000001 then
+            local Scale = Budget / Magnitude
+
+            Dx = Dx * Scale
+            Dz = Dz * Scale
+            Dy = Dy * Scale
+            NextY = Here.Y + Dy
+        end
+
+        local NextX = Here.X + Dx
+        local NextZ = Here.Z + Dz
+        local Under = self:Sample(NextX, NextZ, NextY)
+
+        if Under then
+            local Floor = Under + Clearance - 0.15
+
+            if NextY < Floor then
+                NextY = Floor
+
+                local FixX = NextX - Here.X
+                local FixY = NextY - Here.Y
+                local FixZ = NextZ - Here.Z
+                local FixMagnitude = math.sqrt(FixX * FixX + FixY * FixY + FixZ * FixZ)
+
+                if FixMagnitude > Budget and FixMagnitude > 0.000001 then
+                    local FixScale = Budget / FixMagnitude
+
+                    NextX = Here.X + FixX * FixScale
+                    NextZ = Here.Z + FixZ * FixScale
+                    NextY = Here.Y + FixY * FixScale
+                end
+            end
+        end
+
+        local Rotation = Root.CFrame - Here
+        local Look = CFrame.lookAt(Vector3.new(0, 0, 0), Direction)
+        local Smoothed = Rotation:Lerp(Look, math.clamp(Elapsed * 9, 0, 1))
+
+        Root.CFrame = CFrame.new(NextX, NextY, NextZ) * Smoothed
+        Root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        Root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+
+        return "moving"
+    end
+
+    function Walker:Approach(Position, Seconds)
+        local Character = Player.Character
+        local Root = Character and Character:FindFirstChild("HumanoidRootPart")
+        local Humanoid = self:GetHumanoid()
+
+        if not Root or not Humanoid then
+            return false
+        end
+
+        local Finish = os.clock() + (Seconds or 0.6)
+
+        self:SetNoclip(false)
+
+        while os.clock() < Finish do
+            local Current = self:GetRoot()
+
+            if not Current or Collector.Enabled ~= true then
+                break
+            end
+
+            local Delta = Position - Current.Position
+            local Flat = Vector3.new(Delta.X, 0, Delta.Z)
+
+            if Flat.Magnitude <= 1.2 then
+                Humanoid:Move(Vector3.new(0, 0, 0), false)
+
+                break
+            end
+
+            Humanoid:Move(Flat.Unit, false)
+            Humanoid.WalkSpeed = math.max(Humanoid.WalkSpeed, 16)
+
+            RunService.Heartbeat:Wait()
+        end
+
+        self:Stop()
+
+        return true
+    end
+
+    function Walker:GhostTo(Position)
+        local Root = self:GetRoot()
+
+        if not Root then
+            return false
+        end
+
+        self:SetNoclip(true)
+
+        local Clearance = self:GetClearance()
+        local Ground = self:Sample(Position.X, Position.Z, Position.Y)
+        local TargetY = Position.Y + Clearance
+
+        if Ground then
+            TargetY = Ground + Clearance
+        end
+
+        Root.CFrame = CFrame.new(Vector3.new(Position.X, TargetY, Position.Z)) * (Root.CFrame - Root.Position)
+        Root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        Root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+
+        self:Settle(0.18)
+
+        return true
+    end
+
+    function Walker:GetDetourOffset()
+        local Root = self:GetRoot()
+
+        if not Root then
+            return nil
+        end
+
+        local Side = -1
+
+        if self.SideFlip then
+            Side = 1
+        end
+
+        self.SideFlip = not self.SideFlip
+
+        local Right = Root.CFrame.RightVector
+        local Offset = Vector3.new(Right.X, 0, Right.Z)
+
+        if Offset.Magnitude <= 0.001 then
+            return nil
+        end
+
+        return Offset.Unit * (9 * Side)
+    end
+
+    function Walker:Slide(Offset)
+        local Guard = 0
+
+        while Guard < 40 do
+            Guard = Guard + 1
+
+            if Collector.Enabled ~= true then
+                return false
+            end
+
+            local From = self:GetRoot()
+
+            if not From then
+                return false
+            end
+
+            local Target = From.Position + Offset
+
+            if (Target - From.Position).Magnitude <= 2 then
+                return true
+            end
+
+            local Result = self:Step(Target, 1.5)
+
+            if Result == "done" then
+                return true
+            end
+
+            if Result ~= "moving" then
+                return false
+            end
+
+            RunService.Heartbeat:Wait()
+        end
+
+        return false
+    end
+
+    function Walker:To(Position, StopDistance, MaxSeconds)
+        local Root = self:GetRoot()
+
+        if not Root then
+            return false
+        end
+
+        local Started = os.clock()
+        local Timeout = MaxSeconds or ((Root.Position - Position).Magnitude / self:GetSpeed() * 2.5 + 5)
+        local Blocked = 0
+
+        self.Busy = true
+        self.WantDetour = false
+        self.LastTick = os.clock()
+
+        self:SetNoclip(true)
+
+        while true do
+            if Collector.Enabled ~= true then
+                self:Cancel()
+
+                return false
+            end
+
+            if os.clock() - Started > Timeout then
+                self:SetNoclip(false)
+                self:Stop()
+
+                self.Busy = false
+
+                return false
+            end
+
+            local CurrentRoot = self:GetRoot()
+            local Humanoid = self:GetHumanoid()
+
+            if not CurrentRoot or not Humanoid or Humanoid.Health <= 0 then
+                self:Cancel()
+
+                return false
+            end
+
+            if self.WantDetour then
+                self.WantDetour = false
+
+                local Offset = self:GetDetourOffset()
+
+                if Offset then
+                    self:Slide(Offset)
+                end
+            end
+
+            local Result = self:Step(Position, StopDistance)
+
+            if Result == "done" then
+                self:SetNoclip(false)
+                self:Stop()
+
+                self.Busy = false
+
+                return true
+            end
+
+            if Result == "abort" then
+                self:Cancel()
+
+                return false
+            end
+
+            if Result == "blocked" then
+                Blocked = Blocked + 1
+
+                if Blocked == 2 then
+                    Humanoid.Jump = true
+                end
+
+                if Blocked == 4 then
+                    self.WantDetour = true
+                end
+
+                if Blocked >= 8 then
+                    self:SetNoclip(false)
+                    self:Stop()
+
+                    self.Busy = false
+
+                    return false
+                end
+            else
+                Blocked = 0
+            end
+
+            RunService.Heartbeat:Wait()
+        end
+    end
+end
+
+do
+    local Ignored = {}
+
+    function Collector:IsIgnored(Drop)
+        local Until = Ignored[ Drop ]
+
+        if not Until then
+            return false
+        end
+
+        if os.clock() < Until then
+            return true
+        end
+
+        Ignored[ Drop ] = nil
+
+        return false
+    end
+
+    function Collector:Ignore(Drop, Seconds)
+        Ignored[ Drop ] = os.clock() + (Seconds or 8)
+    end
+
+    function Collector:Kill()
+        self.Dying = true
+        self.Stuck = 0
+        self.Target = nil
+        self.TargetReachedAt = 0
+
+        Walker:Cancel()
+
+        local Character = Player.Character
+        local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
+
+        if not Humanoid then
+            self.Dying = false
+
+            return
+        end
+
+        Humanoid.Health = 0
+
+        local Started = os.clock()
+
+        task.wait(0.5)
+
+        if Player.Character == Character and Humanoid.Health > 0 then
+            pcall(function()
+                Character:BreakJoints()
+            end)
+        end
+
+        while Player.Character == Character and os.clock() - Started < 6 do
+            task.wait(0.1)
+        end
+
+        while not Player.Character and os.clock() - Started < 20 do
+            task.wait(0.1)
+        end
+
+        local Respawned = os.clock()
+
+        while os.clock() - Respawned < 8 do
+            local NewCharacter = Player.Character
+            local NewHumanoid = NewCharacter and NewCharacter:FindFirstChildOfClass("Humanoid")
+
+            if NewHumanoid and NewHumanoid.Health > 0 then
+                break
+            end
+
+            task.wait(0.1)
+        end
+
+        task.wait(1)
+
+        self.Dying = false
+    end
+
+    function Collector:IsStuck()
+        return self.Stuck >= self.StuckLimit
+    end
+
+    function Collector:TrackTarget(Drop)
+        if self.Target == Drop then
+            return
+        end
+
+        self.Target = Drop
+        self.TargetReachedAt = os.clock()
+        self.Stuck = 0
+    end
+
+    function Collector:UpdateStuck(Drop)
+        self:TrackTarget(Drop)
+
+        local Root = Walker:GetRoot()
+        local Part = Items:GetPart(Drop)
+
+        if not Root or not Part then
+            return false
+        end
+
+        local Spent = os.clock() - self.TargetReachedAt
+
+        if Spent < self.StuckTimeout then
+            return false
+        end
+
+        if (Root.Position - Part.Position).Magnitude <= self.StuckDistance then
+            self.Stuck = 0
+            self.TargetReachedAt = os.clock()
+
+            return false
+        end
+
+        self.Stuck = self.Stuck + 1
+        self.TargetReachedAt = os.clock()
+
+        return self:IsStuck()
+    end
+
+    function Collector:Request(Drop)
+        local UUID = Drop:GetAttribute("UUID")
+
+        if type(UUID) ~= "string" then
+            return false, "INVALID"
+        end
+
+        local Channel = Items:GetChannel()
+
+        if Channel then
+            local Success, Result = pcall(function()
+                return Channel:InvokeServer(UUID)
+            end)
+
+            if not Success then
+                return false, "NETWORK"
+            end
+
+            if type(Result) ~= "table" then
+                return false, "NETWORK"
+            end
+
+            if Result.Success == true then
+                return true, nil
+            end
+
+            return false, Result.Reason or "UNKNOWN"
+        end
+
+        local Client = Items:GetClient()
+
+        if Client then
+            local Success, Result = pcall(function()
+                return Client.Request(Drop)
+            end)
+
+            if Success and Result then
+                return true, nil
+            end
+
+            return false, "CLIENT"
+        end
+
+        local Part = Items:GetPart(Drop)
+        local Prompt = Part and Part:FindFirstChildOfClass("ProximityPrompt")
+
+        if not Prompt then
+            return false, "NO_REMOTE"
+        end
+
+        Prompt.Enabled = true
+
+        local Success = pcall(fireproximityprompt, Prompt)
+
+        if not Success then
+            return false, "NO_REMOTE"
+        end
+
+        return true, nil
+    end
+
+    function Collector:FindNearest()
+        local Folder = Items:GetFolder()
+        local Root = Walker:GetRoot()
+
+        if not Folder or not Root then
+            return nil
+        end
+
+        local Best, BestDistance = nil, math.huge
+
+        for _, Drop in Folder:GetChildren() do
+            if Items:IsValid(Drop) and not self:IsIgnored(Drop) then
+                local Part = Items:GetPart(Drop)
+
+                if Part then
+                    local Distance = (Root.Position - Part.Position).Magnitude
+
+                    if Distance < BestDistance then
+                        Best, BestDistance = Drop, Distance
+                    end
+                end
+            end
+        end
+
+        return Best
+    end
+
+    function Collector:GiveUp(Drop, Seconds)
+        self:Ignore(Drop, Seconds or 20)
+        self:Reset()
+    end
+
+    function Collector:Collect(Drop)
+        self:TrackTarget(Drop)
+
+        local StartRoot = Walker:GetRoot()
+        local StartPart = Items:GetPart(Drop)
+        local Distance = 60
+
+        if StartRoot and StartPart then
+            Distance = (StartRoot.Position - StartPart.Position).Magnitude
+        end
+
+        local Deadline = os.clock() + math.clamp(Distance / Walker:GetSpeed() * 2.5, 5, 20)
+
+        while os.clock() < Deadline do
+            if self.Enabled ~= true or self.Dying then
+                return false
+            end
+
+            if not Items:IsValid(Drop) then
+                self:Reset()
+                return true
+            end
+
+            local Part = Items:GetPart(Drop)
+
+            if not Part then
+                return false
+            end
+
+            local Root = Walker:GetRoot()
+
+            if not Root then
+                return false
+            end
+
+            local Gap = (Root.Position - Part.Position).Magnitude
+
+            if Gap > 8 then
+                Walker:To(Part.Position, 3, 3)
+
+                Root = Walker:GetRoot()
+                Part = Items:GetPart(Drop)
+
+                if not Root or not Part then
+                    return false
+                end
+
+                Gap = (Root.Position - Part.Position).Magnitude
+            end
+
+            if Gap > 8 then
+                Walker:GhostTo(Part.Position)
+                Walker:SnapToGround()
+                Walker:Settle(0.4)
+            end
+
+            Walker:Approach(Part.Position, 0.5)
+            Walker:SnapToGround()
+
+            local Success, Reason = self:Request(Drop)
+
+            self.LastReason = Reason or "OK"
+
+            if Success or not Items:IsValid(Drop) then
+                Walker:Stop()
+                self:Reset()
+
+                return true
+            end
+
+            Part = Items:GetPart(Drop)
+
+            if not Part then
+                self:Reset()
+                return true
+            end
+
+            if Reason == "MISSING" or Reason == "EXPIRED" or Reason == "INVALID" then
+                self:Reset()
+                return true
+            end
+
+            if Reason == "NO_CHARACTER" then
+                return false
+            end
+
+            if Reason == "TOO_FAR" then
+                Walker:Approach(Part.Position, 0.45)
+                Walker:SnapToGround()
+            elseif Reason == "MOVEMENT_PENDING" then
+                Walker:Approach(Part.Position, 0.4)
+            elseif Reason == "RATE_LIMITED" or Reason == "BUSY" then
+                task.wait(0.2)
+            else
+                task.wait(0.16)
+            end
+
+            if self:UpdateStuck(Drop) then
+                self:GiveUp(Drop, 30)
+                self:Kill()
+
+                return false
+            end
+        end
+
+        Walker:Stop()
+        self:GiveUp(Drop, 8)
+
+        return false
+    end
+
+    function Collector:Reset()
+        self.Stuck = 0
+        self.Target = nil
+        self.TargetReachedAt = 0
+
+        Walker.WantDetour = false
+    end
+
+    function Collector:CollectNearest()
+        if self.Enabled ~= true or self.Dying then
+            return false
+        end
+
+        if Walker:IsBusy() then
+            return false
+        end
+
+        local Drop = self:FindNearest()
+
+        if not Drop then
+            return false
+        end
+
+        local Result = self:Collect(Drop)
+
+        if Result then
+            self.Picked = self.Picked + 1
+        end
+
+        return Result
+    end
+
+    function Collector:CollectAll()
+        while self.Enabled == true and not self.Dying do
+            local Moved = self:CollectNearest()
+
+            if self.Enabled ~= true or self.Dying then
+                break
+            end
+
+            if not Moved then
+                local Folder = Items:GetFolder()
+
+                if not Folder then
+                    break
+                end
+
+                local Pending = false
+
+                for _, Drop in Folder:GetChildren() do
+                    if Items:IsValid(Drop) and not self:IsIgnored(Drop) then
+                        Pending = true
+
+                        break
+                    end
+                end
+
+                if not Pending then
+                    break
+                end
+
+                task.wait(0.2)
+            end
+        end
+    end
+end
+
+Collector.Enabled = false
+Collector.Picked = 0
+Collector.Dying = false
+Collector.Stuck = 0
+Collector.StuckLimit = 3
+Collector.StuckTimeout = 6
+Collector.StuckDistance = 12
+Collector.Target = nil
+Collector.TargetReachedAt = 0
+Collector.LastReason = "OK"
+Walker.Busy = false
+Walker.Multiplier = 1.8
+Walker.MaxClimb = 4
+Walker.MaxDrop = 40
+Walker.RiseSpeed = 60
+Walker.FallSpeed = 140
+Walker.LastTick = 0
+Walker.WantDetour = false
+Walker.SideFlip = false
+Walker.Detours = 0
+
+local Window = Fluent:CreateWindow({
+    Title = "Halo Archives",
+    SubTitle = "By Xin",
+    Search = true,
+    Icon = "archive",
+    TabWidth = 160,
+    Size = UDim2.fromOffset(580, 460),
+    Acrylic = false,
+    Theme = "Dark",
+    MinimizeKey = Enum.KeyCode.LeftControl
+})
+
+local Tabs = {
+    Main = Window:AddTab({ Title = "Main", Icon = "list" })
+}
+
+do
+    Tabs.Main:AddSection("Items", "archive-restore")
+
+    local Info = Tabs.Main:AddParagraph({
+        Icon = "info",
+        Title = "Status",
+        Content = "Idle"
+    })
+
+    local Toggle = Tabs.Main:AddToggle("AutoCollectItems", {
+        Title = "Auto Collect Items",
+        Description = "Tween to every dropped item and pick it all up",
+        Default = false
+    })
+
+    Toggle:OnChanged(function(Value)
+        Collector.Enabled = Value
+
+        if not Value then
+            Walker:Cancel()
+        end
+    end)
+
+    task.spawn(function()
+        while task.wait(0.1) do
+            if Collector.Enabled then
+                Collector:CollectAll()
+            end
+
+            if Fluent.Unloaded then
+                break
+            end
+        end
+    end)
+
+    task.spawn(function()
+        while task.wait(1) do
+            pcall(function()
+                local Channel = Items:GetChannel()
+                local Remote = "no remote"
+
+                if Channel then
+                    Remote = "remote ok"
+                end
+
+                local State = "Idle"
+
+                if Collector.Dying then
+                    State = "Respawning"
+                elseif Collector.Enabled then
+                    State = "Collecting"
+                end
+
+                Info:SetDesc(string.format(
+                    "Picked %d | Ground %d | Stuck %d/%d | %s | %s | %s",
+                    Collector.Picked,
+                    Items:Count(),
+                    Collector.Stuck,
+                    Collector.StuckLimit,
+                    State,
+                    Collector.LastReason,
+                    Remote
+                ))
+            end)
+
+            if Fluent.Unloaded then
+                break
+            end
+        end
+    end)
+end
+
+UserInputService.WindowFocusReleased:Connect(function()
+    Walker:Cancel()
+end)
+
+Window:SelectTab(1)
+
+Fluent:Notify({
+    Title = "Halo Archives",
+    Content = "Auto collect is ready.",
+    Duration = 6
+})
 
